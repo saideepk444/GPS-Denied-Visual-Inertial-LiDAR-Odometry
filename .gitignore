@@ -1,0 +1,9 @@
+build/
+install/
+log/
+.colcon*
+.vscode/
+.DS_Store
+*.bag
+*.pcd
+*.mp4
