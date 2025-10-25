@@ -7,3 +7,4 @@ log/
 *.bag
 *.pcd
 *.mp4
+Dockerfile
