@@ -12,6 +12,11 @@
 
 #include <Eigen/Dense>
 
+// Simple LiDAR odometry:
+// - Downsample incoming /lidar/points with a voxel grid
+// - Run point-to-point ICP against the previous scan
+// - Accumulate global pose and publish /lidar/odom
+// Covariance[0] carries a boolean-like "ICP converged" flag for downstream gating.
 class LidarOdomNode : public rclcpp::Node
 {
 public:
@@ -35,6 +40,7 @@ private:
   using PointT = pcl::PointXYZ;
   using CloudT = pcl::PointCloud<PointT>;
 
+  // Voxel grid downsampling to stabilize ICP and reduce load
   CloudT::Ptr downsample(const CloudT::Ptr &cloud)
   {
     pcl::VoxelGrid<PointT> vg;
@@ -63,7 +69,7 @@ private:
       return;
     }
 
-    pcl::IterativeClosestPoint<PointT, PointT> icp;
+    pcl::IterativeClosestPoint<PointT, PointT> icp; // point-to-point ICP
     icp.setMaxCorrespondenceDistance(max_correspondence_distance_);
     icp.setMaximumIterations(50);
     icp.setInputSource(filtered);
@@ -76,6 +82,7 @@ private:
       return;
     }
 
+    // Update global pose with the incremental transform from ICP
     const Eigen::Matrix4f T = icp.getFinalTransformation();
     Eigen::Isometry3d delta = Eigen::Isometry3d::Identity();
     delta.linear() = T.block<3, 3>(0, 0).cast<double>();
@@ -88,6 +95,7 @@ private:
     publish_odom(msg->header.stamp, icp.hasConverged());
   }
 
+  // Publish odometry with a simple covariance flag for convergence
   void publish_odom(const rclcpp::Time &stamp, bool converged)
   {
     nav_msgs::msg::Odometry odom;

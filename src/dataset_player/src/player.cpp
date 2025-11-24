@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+// Plays back EuRoC-style cam0/imu0 streams as ROS 2 topics with correct timing.
 class DatasetPlayer : public rclcpp::Node
 {
 public:
@@ -36,6 +37,7 @@ public:
     img_pub_ = create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", 10);
     imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("/imu", 50);
 
+    // Parse dataset immediately so we know if playback is possible.
     if (!load_dataset()) {
       RCLCPP_ERROR(get_logger(), "Failed to load dataset; node will idle.");
       return;
@@ -54,6 +56,7 @@ public:
   }
 
 private:
+  // Raw parsed IMU row
   struct ImuSample
   {
     uint64_t t_ns;
@@ -65,7 +68,7 @@ private:
     double az;
   };
 
-  struct CamSample
+  // Parsed camera entry (timestamp + image path)
   {
     uint64_t t_ns;
     std::string path;
@@ -95,10 +98,10 @@ private:
     const std::string cam_csv = dataset_root_ + "/cam0/data.csv";
     const std::string cam_data_dir = dataset_root_ + "/cam0/data";
 
-    if (!load_imu_csv(imu_csv)) {
+    if (!load_imu_csv(imu_csv)) { // requires imu0/data.csv
       return false;
     }
-    if (!load_cam_csv(cam_csv, cam_data_dir)) {
+    if (!load_cam_csv(cam_csv, cam_data_dir)) { // requires cam0/data.csv + data/
       return false;
     }
 
@@ -116,6 +119,7 @@ private:
     return true;
   }
 
+  // Parse EuRoC imu0/data.csv -> imu_samples_
   bool load_imu_csv(const std::string &path)
   {
     std::ifstream file(path);
@@ -167,6 +171,7 @@ private:
     return true;
   }
 
+  // Parse EuRoC cam0/data.csv -> cam_samples_
   bool load_cam_csv(const std::string &csv_path, const std::string &data_dir)
   {
     std::ifstream file(csv_path);
@@ -212,6 +217,7 @@ private:
     return true;
   }
 
+  // Build unified time-ordered event list for sleep/publish loop
   void build_events()
   {
     events_.clear();
@@ -228,6 +234,7 @@ private:
               [](const Event &a, const Event &b) { return a.t_ns < b.t_ns; });
   }
 
+  // Sleeps against wall-clock to mimic dataset timing, then publishes events
   void playback_loop()
   {
     RCLCPP_INFO(get_logger(), "Starting playback: rate_scale=%.2f loop=%s start_time=%.2fs",
@@ -261,6 +268,7 @@ private:
     RCLCPP_INFO(get_logger(), "Playback finished.");
   }
 
+  // Busy-wait with short sleeps until target_seconds since start
   void wait_until(const std::chrono::steady_clock::time_point &start, double target_seconds)
   {
     while (running_ && rclcpp::ok()) {
@@ -273,6 +281,7 @@ private:
     }
   }
 
+  // Dispatch to IMU or camera publisher
   void publish_event(const Event &event)
   {
     if (event.type == EventType::IMU) {
@@ -282,6 +291,7 @@ private:
     }
   }
 
+  // Publish one IMU sample with dataset-relative stamp
   void publish_imu(const ImuSample &sample)
   {
     sensor_msgs::msg::Imu msg;
@@ -296,6 +306,7 @@ private:
     imu_pub_->publish(msg);
   }
 
+  // Load image from disk and publish as mono8
   void publish_image(const CamSample &sample)
   {
     const cv::Mat img = cv::imread(sample.path, cv::IMREAD_GRAYSCALE);

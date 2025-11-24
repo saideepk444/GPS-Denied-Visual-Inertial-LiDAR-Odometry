@@ -6,6 +6,12 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <cv_bridge/cv_bridge.h>
 
+#include <gtsam/navigation/ImuFactor.h>
+#include <gtsam/navigation/ImuBias.h>
+#include <gtsam/navigation/PreintegratedImuMeasurements.h>
+#include <gtsam/navigation/PreintegrationParams.h>
+#include <gtsam/navigation/NavState.h>
+
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core/eigen.hpp>
 #include <opencv2/imgproc.hpp>
@@ -16,6 +22,11 @@
 #include <optional>
 #include <vector>
 
+// Lightweight VIO frontend:
+// - Buffers IMU and preintegrates between image frames (GTSAM)
+// - Tracks features with LK optical flow
+// - Combines IMU rotation prior with vision pose (recoverPose)
+// - Publishes /vio/odom and stores feature count in covariance[1] for fusion gating
 class VIONode : public rclcpp::Node
 {
 public:
@@ -31,6 +42,10 @@ public:
     camera_frame_id_ = declare_parameter<std::string>("camera_frame", "camera");
     odom_frame_id_ = declare_parameter<std::string>("odom_frame", "odom");
     min_tracked_for_pose_ = declare_parameter<int>("min_tracked_for_pose", 15);
+    accel_noise_ = declare_parameter<double>("accel_noise", 0.05);
+    gyro_noise_ = declare_parameter<double>("gyro_noise", 0.01);
+    accel_bias_noise_ = declare_parameter<double>("accel_bias_noise", 0.0005);
+    gyro_bias_noise_ = declare_parameter<double>("gyro_bias_noise", 0.0005);
 
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
         "/imu", 200, std::bind(&VIONode::imu_callback, this, std::placeholders::_1));
@@ -40,7 +55,20 @@ public:
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/vio/odom", 20);
 
     pose_.setIdentity();
-    RCLCPP_INFO(get_logger(), "VIO node ready: feature_count=%d", feature_count_);
+    velocity_.setZero();
+    bias_ = gtsam::imuBias::ConstantBias(); // zero biases
+
+    // Preintegration params (gravity along -Z)
+    auto pim_params = gtsam::PreintegrationParams::MakeSharedU(9.81);
+    pim_params->accelerometerCovariance = gtsam::I_3x3 * accel_noise_ * accel_noise_;
+    pim_params->gyroscopeCovariance = gtsam::I_3x3 * gyro_noise_ * gyro_noise_;
+    pim_params->integrationCovariance = gtsam::I_3x3 * 1e-6;
+    pim_params->biasAccCovariance = gtsam::I_3x3 * accel_bias_noise_ * accel_bias_noise_;
+    pim_params->biasOmegaCovariance = gtsam::I_3x3 * gyro_bias_noise_ * gyro_bias_noise_;
+    preintegrator_ = std::make_unique<gtsam::PreintegratedImuMeasurements>(pim_params, bias_);
+
+    RCLCPP_INFO(get_logger(), "VIO node ready: features=%d, min_tracked=%d",
+                feature_count_, min_tracked_for_pose_);
   }
 
 private:
@@ -60,7 +88,17 @@ private:
     data.accel = Eigen::Vector3d(msg->linear_acceleration.x, msg->linear_acceleration.y,
                                  msg->linear_acceleration.z);
     imu_buffer_.push_back(data);
-    // keep last ~1s of IMU
+
+    // Integrate into preintegrator as measurements arrive.
+    if (last_imu_stamp_.nanoseconds() != 0) {
+      const double dt = (msg->header.stamp - last_imu_stamp_).seconds();
+      if (dt > 0.0) {
+        preintegrator_->integrateMeasurement(data.accel, data.gyro, dt);
+      }
+    }
+    last_imu_stamp_ = msg->header.stamp;
+
+    // keep last ~1s of IMU for diagnostics (not required for preintegration)
     const rclcpp::Time cutoff = msg->header.stamp - rclcpp::Duration(1, 0);
     while (!imu_buffer_.empty() && imu_buffer_.front().stamp < cutoff) {
       imu_buffer_.pop_front();
@@ -76,9 +114,10 @@ private:
     }
 
     if (prev_image_.empty()) {
+      // First frame: just detect features and start preintegrator window.
       detect_features(gray);
       prev_stamp_ = msg->header.stamp;
-      prev_image_ = gray;
+      preintegrator_->resetIntegrationAndSetBias(bias_);
       return;
     }
 
@@ -105,7 +144,10 @@ private:
       return;
     }
 
-    Eigen::Matrix3d imu_prior = integrate_imu(prev_stamp_, msg->header.stamp);
+    // IMU preintegrated delta between prev and current frame
+    gtsam::NavState imu_pred = preintegrator_->predict(
+        gtsam::NavState(gtsam::Pose3(pose_), gtsam::Vector3(velocity_.x(), velocity_.y(), velocity_.z())),
+        bias_);
 
     cv::Mat mask;
     cv::Mat E = cv::findEssentialMat(tracked_prev, tracked_curr, focal_length_, cv::Point2d(cx_, cy_),
@@ -120,40 +162,25 @@ private:
     cv::cv2eigen(t_cv, t_eig);
     t_eig.normalize();
 
+    // Combine IMU rotation prior with visual rotation (simple composition)
     Eigen::Isometry3d delta = Eigen::Isometry3d::Identity();
-    delta.linear() = imu_prior * R_cv_eig;
-    delta.translation() = delta.linear() * t_eig * 0.1; // small baseline scale
+    delta.linear() = imu_pred.pose().rotation().matrix() * R_cv_eig;
+    // Scale translation with a small baseline; could be refined with scale estimation
+    delta.translation() = delta.linear() * t_eig * 0.1;
 
     pose_ = pose_ * delta;
+    velocity_ = imu_pred.v();
 
     publish_odom(msg->header.stamp, inliers, tracked_prev.size());
 
+    // Reset preintegration window at this keyframe
+    preintegrator_->resetIntegrationAndSetBias(bias_);
     prev_features_ = tracked_curr;
     if (static_cast<int>(prev_features_.size()) < feature_count_ / 2) {
       detect_features(gray);
     }
-    prev_image_ = gray;
     prev_stamp_ = msg->header.stamp;
-  }
-
-  Eigen::Matrix3d integrate_imu(const rclcpp::Time &start, const rclcpp::Time &end)
-  {
-    Eigen::Vector3d delta_theta = Eigen::Vector3d::Zero();
-    rclcpp::Time last = start;
-    for (const auto &sample : imu_buffer_) {
-      if (sample.stamp <= start || sample.stamp > end) {
-        continue;
-      }
-      const double dt = (sample.stamp - last).seconds();
-      delta_theta += sample.gyro * dt;
-      last = sample.stamp;
-    }
-    const double angle = delta_theta.norm();
-    Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
-    if (angle > 1e-6) {
-      R = Eigen::AngleAxisd(angle, delta_theta.normalized()).toRotationMatrix();
-    }
-    return R;
+    prev_image_ = gray;
   }
 
   void detect_features(const cv::Mat &img)
@@ -177,7 +204,7 @@ private:
     odom.pose.pose.orientation.z = q.z();
     odom.pose.pose.orientation.w = q.w();
 
-    // store tracking confidence in covariance[0]
+    // store tracking confidence in covariance[0] and features tracked in covariance[1] (used by fusion)
     odom.pose.covariance[0] = static_cast<double>(inliers);
     odom.pose.covariance[1] = static_cast<double>(tracked);
 
@@ -192,8 +219,12 @@ private:
   cv::Mat prev_image_;
   std::vector<cv::Point2f> prev_features_;
   rclcpp::Time prev_stamp_{};
+  rclcpp::Time last_imu_stamp_{};
 
   Eigen::Isometry3d pose_;
+  Eigen::Vector3d velocity_;
+  gtsam::imuBias::ConstantBias bias_;
+  std::unique_ptr<gtsam::PreintegratedImuMeasurements> preintegrator_;
 
   int feature_count_{};
   double quality_level_{};
@@ -205,6 +236,10 @@ private:
   std::string imu_frame_id_;
   std::string camera_frame_id_;
   std::string odom_frame_id_;
+  double accel_noise_{};
+  double gyro_noise_{};
+  double accel_bias_noise_{};
+  double gyro_bias_noise_{};
 };
 
 int main(int argc, char **argv)

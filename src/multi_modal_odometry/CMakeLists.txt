@@ -33,6 +33,7 @@ add_executable(vio_node src/vio_node.cpp)
 target_link_libraries(vio_node
   ${OpenCV_LIBS}
   Eigen3::Eigen
+  gtsam
 )
 ament_target_dependencies(vio_node
   rclcpp sensor_msgs nav_msgs geometry_msgs tf2 tf2_eigen tf2_geometry_msgs cv_bridge
