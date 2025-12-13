@@ -25,11 +25,13 @@ public:
     loop_ = declare_parameter<bool>("loop", false);
     start_time_s_ = declare_parameter<double>("start_time_s", 0.0);
 
-    if (rate_scale_ <= 0.0) {
+    if (rate_scale_ <= 0.0)
+    {
       RCLCPP_WARN(get_logger(), "rate_scale must be > 0, resetting to 1.0");
       rate_scale_ = 1.0;
     }
-    if (start_time_s_ < 0.0) {
+    if (start_time_s_ < 0.0)
+    {
       RCLCPP_WARN(get_logger(), "start_time_s must be >= 0, resetting to 0");
       start_time_s_ = 0.0;
     }
@@ -38,7 +40,8 @@ public:
     imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("/imu", 50);
 
     // Parse dataset immediately so we know if playback is possible.
-    if (!load_dataset()) {
+    if (!load_dataset())
+    {
       RCLCPP_ERROR(get_logger(), "Failed to load dataset; node will idle.");
       return;
     }
@@ -50,7 +53,8 @@ public:
   ~DatasetPlayer() override
   {
     running_ = false;
-    if (playback_thread_.joinable()) {
+    if (playback_thread_.joinable())
+    {
       playback_thread_.join();
     }
   }
@@ -68,7 +72,8 @@ private:
     double az;
   };
 
-  // Parsed camera entry (timestamp + image path)
+  // Parsed camera entry
+  struct CamSample
   {
     uint64_t t_ns;
     std::string path;
@@ -89,7 +94,8 @@ private:
 
   bool load_dataset()
   {
-    if (dataset_root_.empty()) {
+    if (dataset_root_.empty())
+    {
       RCLCPP_ERROR(get_logger(), "Parameter 'dataset_root' is empty.");
       return false;
     }
@@ -98,15 +104,18 @@ private:
     const std::string cam_csv = dataset_root_ + "/cam0/data.csv";
     const std::string cam_data_dir = dataset_root_ + "/cam0/data";
 
-    if (!load_imu_csv(imu_csv)) { // requires imu0/data.csv
+    if (!load_imu_csv(imu_csv))
+    { // requires imu0/data.csv
       return false;
     }
-    if (!load_cam_csv(cam_csv, cam_data_dir)) { // requires cam0/data.csv + data/
+    if (!load_cam_csv(cam_csv, cam_data_dir))
+    { // requires cam0/data.csv + data/
       return false;
     }
 
     build_events();
-    if (events_.empty()) {
+    if (events_.empty())
+    {
       RCLCPP_ERROR(get_logger(), "No events to play after parsing dataset.");
       return false;
     }
@@ -119,36 +128,42 @@ private:
     return true;
   }
 
-  // Parse EuRoC imu0/data.csv -> imu_samples_
+  // Parse EuRoC imu0/data.csv
   bool load_imu_csv(const std::string &path)
   {
     std::ifstream file(path);
-    if (!file.is_open()) {
+    if (!file.is_open())
+    {
       RCLCPP_ERROR(get_logger(), "Failed to open IMU csv: %s", path.c_str());
       return false;
     }
 
     std::string line;
     size_t line_no = 0;
-    while (std::getline(file, line)) {
+    while (std::getline(file, line))
+    {
       ++line_no;
-      if (line.empty() || line[0] == '#') {
+      if (line.empty() || line[0] == '#')
+      {
         continue;
       }
 
       std::stringstream ss(line);
       std::string token;
       std::vector<std::string> tokens;
-      while (std::getline(ss, token, ',')) {
+      while (std::getline(ss, token, ','))
+      {
         tokens.push_back(token);
       }
 
-      if (tokens.size() != 7) {
+      if (tokens.size() != 7)
+      {
         RCLCPP_WARN(get_logger(), "IMU line %zu malformed (expected 7 fields)", line_no);
         continue;
       }
 
-      try {
+      try
+      {
         ImuSample sample{};
         sample.t_ns = std::stoull(tokens[0]);
         sample.wx = std::stod(tokens[1]);
@@ -158,59 +173,71 @@ private:
         sample.ay = std::stod(tokens[5]);
         sample.az = std::stod(tokens[6]);
         imu_samples_.push_back(sample);
-      } catch (const std::exception &e) {
+      }
+      catch (const std::exception &e)
+      {
         RCLCPP_WARN(get_logger(), "IMU line %zu parse error: %s", line_no, e.what());
         continue;
       }
     }
 
-    if (imu_samples_.empty()) {
+    if (imu_samples_.empty())
+    {
       RCLCPP_ERROR(get_logger(), "No IMU samples parsed from %s", path.c_str());
       return false;
     }
     return true;
   }
 
-  // Parse EuRoC cam0/data.csv -> cam_samples_
+  // Parse EuRoC cam0/data.csv
   bool load_cam_csv(const std::string &csv_path, const std::string &data_dir)
   {
     std::ifstream file(csv_path);
-    if (!file.is_open()) {
+    if (!file.is_open())
+    {
       RCLCPP_ERROR(get_logger(), "Failed to open camera csv: %s", csv_path.c_str());
       return false;
     }
 
     std::string line;
     size_t line_no = 0;
-    while (std::getline(file, line)) {
+    while (std::getline(file, line))
+    {
       ++line_no;
-      if (line.empty() || line[0] == '#') {
+      if (line.empty() || line[0] == '#')
+      {
         continue;
       }
       std::stringstream ss(line);
       std::string ts_str;
       std::string filename;
-      if (!std::getline(ss, ts_str, ',')) {
+      if (!std::getline(ss, ts_str, ','))
+      {
         RCLCPP_WARN(get_logger(), "Camera line %zu missing timestamp", line_no);
         continue;
       }
-      if (!std::getline(ss, filename)) {
+      if (!std::getline(ss, filename))
+      {
         RCLCPP_WARN(get_logger(), "Camera line %zu missing filename", line_no);
         continue;
       }
 
-      try {
+      try
+      {
         CamSample sample{};
         sample.t_ns = std::stoull(ts_str);
         sample.path = data_dir + "/" + filename;
         cam_samples_.push_back(std::move(sample));
-      } catch (const std::exception &e) {
+      }
+      catch (const std::exception &e)
+      {
         RCLCPP_WARN(get_logger(), "Camera line %zu parse error: %s", line_no, e.what());
         continue;
       }
     }
 
-    if (cam_samples_.empty()) {
+    if (cam_samples_.empty())
+    {
       RCLCPP_ERROR(get_logger(), "No camera samples parsed from %s", csv_path.c_str());
       return false;
     }
@@ -223,15 +250,18 @@ private:
     events_.clear();
     events_.reserve(imu_samples_.size() + cam_samples_.size());
 
-    for (size_t i = 0; i < imu_samples_.size(); ++i) {
+    for (size_t i = 0; i < imu_samples_.size(); ++i)
+    {
       events_.push_back({EventType::IMU, imu_samples_[i].t_ns, i});
     }
-    for (size_t i = 0; i < cam_samples_.size(); ++i) {
+    for (size_t i = 0; i < cam_samples_.size(); ++i)
+    {
       events_.push_back({EventType::CAM, cam_samples_[i].t_ns, i});
     }
 
     std::sort(events_.begin(), events_.end(),
-              [](const Event &a, const Event &b) { return a.t_ns < b.t_ns; });
+              [](const Event &a, const Event &b)
+              { return a.t_ns < b.t_ns; });
   }
 
   // Sleeps against wall-clock to mimic dataset timing, then publishes events
@@ -240,27 +270,33 @@ private:
     RCLCPP_INFO(get_logger(), "Starting playback: rate_scale=%.2f loop=%s start_time=%.2fs",
                 rate_scale_, loop_ ? "true" : "false", start_time_s_);
 
-    do {
+    do
+    {
       const auto wall_start = std::chrono::steady_clock::now();
-      for (const auto &event : events_) {
-        if (!running_ || !rclcpp::ok()) {
+      for (const auto &event : events_)
+      {
+        if (!running_ || !rclcpp::ok())
+        {
           return;
         }
 
         const double t_rel = static_cast<double>(event.t_ns - t0_ns_) * 1e-9;
-        if (t_rel < start_time_s_) {
+        if (t_rel < start_time_s_)
+        {
           continue; // skip the initial portion if requested
         }
         const double target = (t_rel - start_time_s_) / rate_scale_;
         wait_until(wall_start, target);
 
-        if (!running_ || !rclcpp::ok()) {
+        if (!running_ || !rclcpp::ok())
+        {
           return;
         }
         publish_event(event);
       }
 
-      if (loop_) {
+      if (loop_)
+      {
         RCLCPP_INFO(get_logger(), "Looping sequence from start");
       }
     } while (loop_ && running_ && rclcpp::ok());
@@ -271,10 +307,12 @@ private:
   // Busy-wait with short sleeps until target_seconds since start
   void wait_until(const std::chrono::steady_clock::time_point &start, double target_seconds)
   {
-    while (running_ && rclcpp::ok()) {
+    while (running_ && rclcpp::ok())
+    {
       const double elapsed =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-      if (elapsed + 0.001 >= target_seconds) {
+      if (elapsed + 0.001 >= target_seconds)
+      {
         break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -284,9 +322,12 @@ private:
   // Dispatch to IMU or camera publisher
   void publish_event(const Event &event)
   {
-    if (event.type == EventType::IMU) {
+    if (event.type == EventType::IMU)
+    {
       publish_imu(imu_samples_[event.idx]);
-    } else {
+    }
+    else
+    {
       publish_image(cam_samples_[event.idx]);
     }
   }
@@ -310,7 +351,8 @@ private:
   void publish_image(const CamSample &sample)
   {
     const cv::Mat img = cv::imread(sample.path, cv::IMREAD_GRAYSCALE);
-    if (img.empty()) {
+    if (img.empty())
+    {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                            "Failed to read image: %s", sample.path.c_str());
       return;

@@ -1,74 +1,75 @@
-# GPS-denied Visual–Inertial–LiDAR Odometry (C++/ROS 2)
+# GPS-denied Visual–Inertial–LiDAR Odometry (ROS 2, C++)
 
-End-to-end ROS 2 pipeline for GPS-denied odometry:
-- Dataset player that replays EuRoC-style camera + IMU topics with correct timing.
-- LiDAR ICP odometry frontend.
-- Factor-graph fusion backend (GTSAM) combining VIO and LiDAR odometry.
+ROS 2 workspace that replays EuRoC-style data and produces fused odometry by combining a lightweight visual–inertial frontend, a LiDAR ICP odometry frontend, and a GTSAM factor-graph backend.
 
-## Repository layout
-- `src/dataset_player`: Publishes EuRoC `cam0` and `imu0` as ROS topics with dataset timestamps.
-- `src/multi_modal_odometry/src/lidar_odom_node.cpp`: LiDAR ICP odometry (cloud->cloud ICP against previous scan).
-- `src/multi_modal_odometry/src/fusion_node.cpp`: GTSAM factor graph fusing VIO (/vio/odom) and LiDAR (/lidar/odom) into /fused/odom.
+## Stack at a glance
+- `dataset_player/player`: Replays EuRoC `cam0` images and `imu0` CSV samples as `/camera/image_raw` (mono8) and `/imu` with dataset-relative stamps.
+- `multi_modal_odometry/vio_node`: Tracks features with LK optical flow, uses IMU preintegration as a rotation prior, estimates relative pose with `recoverPose`, and publishes `/vio/odom`. Feature counts are packed into covariance for downstream gating.
+- `multi_modal_odometry/lidar_odom_node`: Downsamples incoming `/lidar/points`, runs point-to-point ICP against the previous scan, accumulates pose, and publishes `/lidar/odom` (covariance[0] toggles ICP convergence).
+- `multi_modal_odometry/fusion_node`: Maintains a GTSAM factor graph with BetweenFactors from VIO/LiDAR plus ImuFactors tying pose/velocity/bias. Gates VIO by feature count and staleness, then publishes optimized `/fused/odom`.
 
-## Quickstart
-1) Source ROS 2 (adjust distro/path as needed):
-   - `source /opt/ros/humble/setup.bash`
-2) Build:
-   - `cd /Users/saideepk4/gpsdenied_ws`
-   - `colcon build --packages-select dataset_player multi_modal_odometry`
-   - `source install/setup.bash`
-3) Run dataset player (EuRoC layout expected: `.../mav0/{cam0,imu0}`):
-   - `ros2 run dataset_player player --ros-args -p dataset_root:=/path/to/EuRoC/MH_01_easy/mav0 -p rate_scale:=1.0 -p loop:=false`
-4) Run VIO (subscribes `/camera/image_raw`, `/imu`, publishes `/vio/odom`):
-   - `ros2 run multi_modal_odometry vio_node`
-5) Run LiDAR odometry (expects `/lidar/points`):
-   - `ros2 run multi_modal_odometry lidar_odom_node`
-6) Run fusion backend (consumes `/vio/odom` and `/lidar/odom`):
-   - `ros2 run multi_modal_odometry fusion_node`
+## Layout
+- `src/dataset_player`: Dataset playback node (EuRoC layout `mav0/{cam0,imu0}`).
+- `src/multi_modal_odometry/src/vio_node.cpp`: VIO frontend using OpenCV + GTSAM preintegration.
+- `src/multi_modal_odometry/src/lidar_odom_node.cpp`: Sequential LiDAR ICP odometry.
+- `src/multi_modal_odometry/src/fusion_node.cpp`: GTSAM fusion backend.
 
-## Node behavior (what each piece does)
-- `dataset_player`:
-  - Parses `imu0/data.csv` and `cam0/data.csv`, builds a time-ordered event queue.
-  - Sleeps against wall-clock to mimic dataset timing; stamps messages with dataset time (relative to first sample).
-  - Publishes `/camera/image_raw` (mono8) and `/imu`.
-  - Params: `dataset_root` (required), `rate_scale` (speed up/down), `loop` (repeat), `start_time_s` (skip initial seconds).
+## Build
+Prereqs: ROS 2 (tested with Humble-style APIs), OpenCV, PCL (common/io/filters/registration), GTSAM, Eigen3.
 
-- `lidar_odom_node`:
-  - Downsamples incoming `/lidar/points` with a voxel grid.
-  - Runs point-to-point ICP against the previous filtered cloud; accumulates pose.
-  - Publishes `/lidar/odom`; uses pose.covariance[0] as a simple “converged” flag.
-  - Params: `voxel_leaf_size` (m), `max_corr_dist` (ICP correspondence distance), `odom_frame`, `lidar_frame`.
+```bash
+source /opt/ros/humble/setup.bash        # adjust to your distro
+cd /Users/saideepk4/gpsdenied_ws
+colcon build --packages-select dataset_player multi_modal_odometry
+source install/setup.bash
+```
 
-- `fusion_node`:
-  - Maintains a GTSAM factor graph with Pose3 nodes.
-  - Adds BetweenFactors from VIO and LiDAR odometry; seeds with an identity prior plus velocity/bias priors.
-  - Adds ImuFactors tying pose/velocity/bias between keyframes; resets preintegration each factor.
-  - Skips VIO factors when `features_tracked` (overloaded into pose.covariance[1]) drops below `feature_threshold` or when VIO is stale vs LiDAR (`vio_timeout_sec`).
-  - Optimizes after each new factor and publishes `/fused/odom`.
-  - Params: `odom_frame`, `fused_frame`, `feature_threshold`, `vio_timeout_sec`, IMU noise params.
+## Running the pipeline
+1) Dataset playback (expects EuRoC folder ending in `mav0`):
+```bash
+ros2 run dataset_player player --ros-args \
+  -p dataset_root:=/path/to/EuRoC/MH_01_easy/mav0 \
+  -p rate_scale:=1.0 -p loop:=false -p start_time_s:=0.0
+```
+2) VIO frontend (consumes `/camera/image_raw`, `/imu`):
+```bash
+ros2 run multi_modal_odometry vio_node
+```
+3) LiDAR odometry (requires a point cloud source on `/lidar/points`):
+```bash
+ros2 run multi_modal_odometry lidar_odom_node
+```
+4) Fusion backend:
+```bash
+ros2 run multi_modal_odometry fusion_node
+```
 
-## Verifying data flow
-- `ros2 topic list` → check `/camera/image_raw`, `/imu`, `/lidar/odom`, `/fused/odom`.
-- `ros2 topic hz /camera/image_raw` (≈20 Hz EuRoC), `/imu` (≈200 Hz).
-- RViz:
-  - Add Image display on `/camera/image_raw`.
-  - Add IMU display on `/imu`.
-  - Add Odometry displays for `/lidar/odom` and `/fused/odom`.
+Check flow with `ros2 topic list` and `ros2 topic hz /camera/image_raw`, `/imu`, `/lidar/odom`, `/fused/odom`. RViz: image display on `/camera/image_raw`, IMU on `/imu`, odometry displays for `/lidar/odom` and `/fused/odom`.
 
-## Evaluation (ATE / drift / throughput)
-- Absolute Trajectory Error (ATE) with evo (requires ground truth CSV/poses):
-  - Save fused odom: `ros2 bag record /fused/odom` during playback.
-  - Convert to TUM format (write a small script) then run: `evo_ape tum gt.txt fused.txt -r full --save_results results.zip`
-- Drift percentage: compute path length vs ATE_rmse (evo outputs both); target <1% drift over sequence.
-- Throughput: monitor `ros2 topic hz /camera/image_raw` (~20–30 Hz), `/lidar/points` (10–20 Hz), `/fused/odom` (should follow slower of inputs). Add `RCLCPP_INFO_THROTTLE` if you need inline Hz logs.
-- KITTI/Gazebo: feed `/lidar/points` from a KITTI player or Gazebo bridge; record `/fused/odom`, compare vs KITTI ground truth with evo; visualize in RViz the same way.
+## Node details and parameters
+**dataset_player/player**
+- Reads `imu0/data.csv` (wx, wy, wz, ax, ay, az) and `cam0/data.csv` (timestamp, filename), builds a time-ordered queue, and sleeps against wall clock so playback timing matches the dataset (scaled by `rate_scale`).
+- Publishes stamps relative to the first dataset timestamp (`RCL_ROS_TIME`).
+- Parameters: `dataset_root` (required), `rate_scale` (>0), `loop` (bool), `start_time_s` (skip initial seconds).
 
-## Tips and assumptions
-- EuRoC is grayscale mono8; stamps are dataset-relative (starting at 0 s).
-- LiDAR odom requires a point cloud source on `/lidar/points`; if using a different dataset, remap the topic.
-- Fusion expects VIO to populate pose.covariance[1] with “features tracked” to gate low-confidence frames.
+**multi_modal_odometry/vio_node**
+- Subscriptions: `/imu` (preintegrated continuously), `/camera/image_raw` (SensorData QoS).
+- Pipeline per frame: detect features with `goodFeaturesToTrack` (first frame), track with LK optical flow, recover relative pose via essential matrix + `recoverPose`, combine IMU rotation prior with vision rotation, scale translation with a small baseline (0.1 m), and propagate velocity from IMU prediction.
+- Publishes `/vio/odom` (`frame_id=odom_frame`, `child_frame_id=camera_frame`). Encodes inliers in `pose.covariance[0]` and tracked feature count in `pose.covariance[1]` for fusion gating.
+- Key params: `feature_count`, `quality_level`, `min_distance`, `focal_length`, `cx`, `cy`, `min_tracked_for_pose`, `odom_frame`, `camera_frame`, IMU noise/bias parameters.
 
-## Next steps
-- Hook up a VIO frontend publishing `/vio/odom` with covariance[1] = tracked feature count.
-- Add bag/dataset launch files to start player + frontends together.
-- Evaluate drift against EuRoC ground truth (e.g., evo_ape, evo_rpe).
+**multi_modal_odometry/lidar_odom_node**
+- Subscriptions: `/lidar/points` (SensorData QoS). Downsamples with a voxel grid, aligns to previous filtered cloud using point-to-point ICP (50 iterations, `max_corr_dist`), and accumulates a global pose.
+- Publishes `/lidar/odom` (`frame_id=odom_frame`, `child_frame_id=lidar_frame`). `pose.covariance[0]` is set to 1.0 when ICP converges.
+- Key params: `voxel_leaf_size` (m), `max_corr_dist` (m), `odom_frame`, `lidar_frame`.
+
+**multi_modal_odometry/fusion_node**
+- Subscriptions: `/vio/odom`, `/lidar/odom`, `/imu`. Maintains Pose3/Vel/Bias nodes keyed by message order, seeded with an identity pose/velocity/bias prior.
+- Adds BetweenFactors for each odometry input plus an ImuFactor and bias BetweenFactor per step. Optimizes with Levenberg–Marquardt every time a new factor is added, resets IMU preintegration with the updated bias, and publishes `/fused/odom`.
+- Gating: skips VIO when tracked features (`covariance[1]`) drop below `feature_threshold` or when VIO is stale vs the last LiDAR message by more than `vio_timeout_sec`.
+- Key params: `odom_frame`, `fused_frame`, `feature_threshold`, `vio_timeout_sec`, IMU noise/bias terms (`accel_noise`, `gyro_noise`, `accel_bias_noise`, `gyro_bias_noise`).
+
+## Notes and assumptions
+- EuRoC images are expected as mono8; if your camera data differs, adjust `camera_frame` and encoding accordingly.
+- LiDAR odometry simply chains scan-to-scan ICP; provide a stable `/lidar/points` source (KITTI player, Gazebo bridge, etc.).
+- Fusion assumes VIO publishes feature count in `pose.covariance[1]` and uses IMU timestamps to preintegrate between factors; keep IMU rate high and monotonic.
